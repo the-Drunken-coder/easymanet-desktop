@@ -51,7 +51,7 @@ jobs:
 
           manifest = {
               "schema_version": 1,
-              "generated_at": dt.datetime.now(dt.UTC).isoformat(),
+              "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
               "release_tag": os.environ["RELEASE_TAG"],
               "source_repo": os.environ["SOURCE_REPO"],
               "source_ref": os.environ["SOURCE_REF"],
