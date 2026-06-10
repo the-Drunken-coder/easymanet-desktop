@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "easymanet-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first EasyMANET desktop operator console"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "EasyMANET Contributors"}
 ]
@@ -16,7 +16,6 @@ keywords = ["openmanet", "mesh", "provisioning", "desktop"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
@@ -34,7 +33,7 @@ dev = [
     "pytest>=7",
     "pytest-cov",
     "setuptools>=68",
-    "tomli>=2",
+    "tomli>=2; python_version < '3.11'",
     "wheel",
 ]
 
@@ -44,10 +43,12 @@ easymanet-desktop = "easymanet_desktop.server:main"
 [tool.setuptools.packages.find]
 where = [
     "packages/core/src",
+    "apps/cli/src",
     "apps/desktop/src",
 ]
 include = [
     "easymanet*",
+    "easymanet_cli*",
     "easymanet_desktop*",
 ]
 
