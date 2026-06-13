@@ -6,7 +6,7 @@ This repository is a generated EasyMANET public product surface.
 - Public repo: `easymanet-desktop`
 - Authoring repo: `the-Drunken-coder/easymanet`
 - Source ref: `main`
-- Source commit: `84643fe816d7a3dd59ca6b4f68de00f66a70fee7`
+- Source commit: `b60c847446a7f91aa7cc17316a7f0c11899ed1b2`
 
 Normal development should happen in the authoring repo. Changes are published
 here by the authoring repo publish process so the public product surfaces do
