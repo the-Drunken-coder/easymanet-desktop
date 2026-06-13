@@ -1,16 +1,19 @@
 from types import SimpleNamespace
+import hashlib
 import json
 from pathlib import Path
-
-import typer
+import subprocess
 
 from easymanet_desktop import bridge
+from easymanet_desktop import mesh
+from easymanet_desktop import payloads
 from easymanet_desktop import server
+from easymanet.flash import FlashErrorCode, FlashEvent
 from easymanet.workspace import WORKSPACE_ENV, ensure_workspace
 
 
 def test_desktop_validate_payload_returns_nodes():
-    payload = server._validate_payload(
+    payload = payloads.validate_payload(
         {
             "config": "examples/three-node-field-mesh.yml",
             "node": "point01",
@@ -19,6 +22,10 @@ def test_desktop_validate_payload_returns_nodes():
 
     assert payload["ok"] is True
     assert "point01" in payload["nodes"]
+    assert payload["node_roles"]["gate01"] == "gate"
+    assert payload["node_roles"]["point01"] == "point"
+    assert payload["node_access"]["gate01"]["local_ap_ssid"] == "gate01-local"
+    assert payload["node_access"]["gate01"]["management_ip"] == "10.41.254.1"
 
 
 def test_desktop_state_reads_configured_images_and_workspace(tmp_path, monkeypatch):
@@ -35,17 +42,42 @@ def test_desktop_state_reads_configured_images_and_workspace(tmp_path, monkeypat
         '{"rpi4-mm6108-spi": {"version": "1.6.5", "sha256": "%s"}}' % ("a" * 64)
     )
 
-    monkeypatch.setattr(server, "CACHE_DIR", cache)
-    monkeypatch.setattr(server, "IMAGES_MANIFEST", manifest)
-    monkeypatch.setattr(server, "get_cached_image", lambda _target: None)
+    monkeypatch.setattr(payloads, "cache_dir", lambda: cache)
+    monkeypatch.setattr(payloads, "images_manifest_path", lambda: manifest)
+    monkeypatch.setattr(payloads, "get_cached_image", lambda _target: None)
 
-    payload = server._state_payload()
+    payload = payloads.state_payload()
 
     assert payload["ok"] is True
     assert payload["workspace"]["root"] == str(workspace)
     assert payload["workspace"]["fleet_files"][0]["relative_path"] == "field.yml"
     assert payload["image_cache_dir"] == str(cache)
     assert payload["images"]["rpi4-mm6108-spi"]["version"] == "1.6.5"
+
+
+def test_desktop_state_reports_cached_image_hash_without_manifest(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv(WORKSPACE_ENV, str(workspace))
+    ensure_workspace()
+    cache = tmp_path / "images"
+    cache.mkdir()
+    image = cache / "openmanet-1.6.5-rpi4-mm6108-spi-squashfs-sysupgrade.img.gz"
+    image.write_bytes(b"firmware")
+    version_file = tmp_path / "version.json"
+    version_file.write_text(json.dumps({"rpi4-mm6108-spi": "1.6.5"}))
+
+    monkeypatch.setattr(payloads, "cache_dir", lambda: cache)
+    monkeypatch.setattr(payloads, "images_manifest_path", lambda: tmp_path / "missing.json")
+    monkeypatch.setattr(payloads, "version_file_path", lambda: version_file)
+    monkeypatch.setattr(payloads, "get_cached_image", lambda _target: None)
+
+    payload = payloads.state_payload()
+    entry = payload["images"]["rpi4-mm6108-spi"]
+
+    assert entry["version"] == "1.6.5"
+    assert entry["cached_path"] == str(image)
+    assert entry["cached_size_bytes"] == len(b"firmware")
+    assert entry["cached_sha256"] == hashlib.sha256(b"firmware").hexdigest()
 
 
 def test_desktop_validate_resolves_workspace_fleet_name(tmp_path, monkeypatch):
@@ -55,17 +87,28 @@ def test_desktop_validate_resolves_workspace_fleet_name(tmp_path, monkeypatch):
     fleet = workspace / "Fleets" / "field.yml"
     fleet.write_text(Path("examples/three-node-field-mesh.yml").read_text())
 
-    payload = server._validate_payload({"config": "field", "node": "point01"})
+    payload = payloads.validate_payload({"config": "field", "node": "point01"})
 
     assert payload["ok"] is True
     assert payload["config_path"] == str(fleet)
     assert "point01" in payload["nodes"]
 
 
-def test_desktop_disks_payload_serializes_disk_info(monkeypatch):
-    monkeypatch.setattr(server, "check_platform", lambda: None)
+def test_desktop_resolve_config_rejects_non_yaml_file(tmp_path):
+    config = tmp_path / "notes.txt"
+    config.write_text("not: fleet\n")
+
+    payload = payloads.resolve_config_payload(config=str(config))
+
+    assert payload["ok"] is False
+    assert payload["errors"] == ["Fleet config file must be .yml or .yaml"]
+    assert payload["config_path"] == str(config)
+
+
+def test_desktop_disks_payload_only_serializes_mounted_disks(monkeypatch):
+    monkeypatch.setattr(payloads, "check_platform", lambda: None)
     monkeypatch.setattr(
-        server,
+        payloads,
         "list_disks",
         lambda include_all=False: [
             SimpleNamespace(
@@ -73,16 +116,85 @@ def test_desktop_disks_payload_serializes_disk_info(monkeypatch):
                 model="USB",
                 size_human="8 GB",
                 removable=True,
+                mounted=["/Volumes/BOOT"],
+                warnings=[],
+            ),
+            SimpleNamespace(
+                device="/dev/disk5",
+                model="Unmounted USB",
+                size_human="16 GB",
+                removable=True,
                 mounted=[],
                 warnings=[],
-            )
+            ),
         ],
     )
 
-    payload = server._disks_payload(include_all=False)
+    payload = payloads.disks_payload(include_all=False)
 
     assert payload["ok"] is True
-    assert payload["disks"][0]["device"] == "/dev/disk4"
+    assert [disk["device"] for disk in payload["disks"]] == ["/dev/disk4"]
+
+
+def test_desktop_mesh_discovery_uses_gateway_topology_api(monkeypatch):
+    monkeypatch.setattr(mesh, "_arp_hosts", lambda: [])
+    monkeypatch.setattr(mesh, "_local_subnet_hosts", lambda: [])
+
+    def fake_probe(candidate):
+        if candidate.node == "gate01" and candidate.host == "gate01.local":
+            return {
+                **candidate.to_dict(),
+                "ok": True,
+                "status": "connected",
+                "hostname": "gate01",
+                "role": "gate",
+                "node_ip": "10.41.1.1",
+                "summary": "gate01 / gate / 10.41.1.1",
+            }
+        return {**candidate.to_dict(), "ok": False, "status": "api_unreachable"}
+
+    def fake_topology(gateway):
+        assert gateway["hostname"] == "gate01"
+        return {
+            "ok": True,
+            "generated_at": "2026-06-13T00:00:00Z",
+            "nodes": [
+                {"name": "gate01", "role": "gate", "ip": "10.41.1.1", "status": "online"},
+                {"name": "point01", "role": "point", "ip": "10.41.2.1", "status": "online"},
+            ],
+            "links": [
+                {"source": "gate01", "target": "point01", "status": "resolved"},
+            ],
+            "warnings": [],
+        }
+
+    payload = mesh.mesh_discover_payload(
+        {"config": "examples/three-node-field-mesh.yml", "scanSubnet": False},
+        probe=fake_probe,
+        topology_fetcher=fake_topology,
+    )
+
+    assert payload["ok"] is True
+    assert payload["candidates_checked"] >= 3
+    assert payload["gateway"]["hostname"] == "gate01"
+    assert [node["name"] for node in payload["nodes"]] == ["gate01", "point01"]
+    assert payload["links"][0]["target"] == "point01"
+    assert payload["seen"][0]["hostname"] == "gate01"
+
+
+def test_desktop_mesh_discovery_reports_missing_gateway_api(monkeypatch):
+    monkeypatch.setattr(mesh, "_arp_hosts", lambda: [])
+    monkeypatch.setattr(mesh, "_local_subnet_hosts", lambda: [])
+
+    payload = mesh.mesh_discover_payload(
+        {"config": "examples/three-node-field-mesh.yml", "scanSubnet": False},
+        probe=lambda candidate: {**candidate.to_dict(), "ok": False, "status": "api_unreachable"},
+    )
+
+    assert payload["ok"] is False
+    assert payload["code"] == "gateway_api_not_found"
+    assert "topology API" in payload["errors"][0]
+    assert payload["nodes"] == []
 
 
 def test_desktop_bridge_validate_outputs_json(capsys):
@@ -102,17 +214,46 @@ def test_desktop_bridge_validate_outputs_json(capsys):
     assert "point01" in payload["nodes"]
 
 
+def test_desktop_bridge_mesh_discover_outputs_json(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bridge,
+        "mesh_discover_payload",
+        lambda payload: {"ok": True, "radios": [], "received": payload},
+    )
+
+    exit_code = bridge.main(
+        [
+            "mesh-discover",
+            "--config",
+            "examples/three-node-field-mesh.yml",
+            "--scan-subnet",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["received"]["scan_subnet"] is True
+
+
 def test_desktop_bridge_flash_plan_outputs_json(monkeypatch, capsys):
     calls = []
 
-    def fake_run_flash(**kwargs):
-        calls.append(kwargs)
-        print("Dry run complete. No changes were made.")
+    def fake_run_flash_workflow(options, emit=None):
+        del emit
+        calls.append(options)
+        return SimpleNamespace(
+            to_dict=lambda include_events=False: {
+                "ok": True,
+                "events": [] if include_events else None,
+                "image": {"cached_path": "/tmp/openmanet.img.gz"},
+            }
+        )
 
-    monkeypatch.setattr(bridge, "run_flash", fake_run_flash)
+    monkeypatch.setattr(bridge, "run_flash_workflow", fake_run_flash_workflow)
     monkeypatch.setattr(
         bridge,
-        "_flash_image_details",
+        "_safe_flash_image_details",
         lambda **_kwargs: {"target": "rpi4-mm6108-spi", "cached_path": "/tmp/openmanet.img.gz"},
     )
 
@@ -133,20 +274,69 @@ def test_desktop_bridge_flash_plan_outputs_json(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["image"]["cached_path"] == "/tmp/openmanet.img.gz"
-    assert calls[0]["dry_run"] is True
-    assert calls[0]["yes"] is False
-    assert calls[0]["enable_ssh"] is True
+    assert calls[0].dry_run is True
+    assert calls[0].yes is False
+    assert calls[0].enable_ssh is True
+
+
+def test_desktop_bridge_flash_plan_preserves_cached_image_metadata(monkeypatch):
+    def fake_run_flash_workflow(options, emit=None):
+        del options, emit
+        return SimpleNamespace(
+            to_dict=lambda include_events=False: {
+                "ok": True,
+                "events": [] if include_events else None,
+                "image": {
+                    "path": "/tmp/openmanet.img.gz",
+                    "cached_path": "/tmp/openmanet.img.gz",
+                    "version": "",
+                    "url": "",
+                    "sha256": "",
+                },
+            }
+        )
+
+    monkeypatch.setattr(bridge, "run_flash_workflow", fake_run_flash_workflow)
+    monkeypatch.setattr(
+        bridge,
+        "_safe_flash_image_details",
+        lambda **_kwargs: {
+            "target": "rpi4-mm6108-spi",
+            "cached_path": "/tmp/openmanet.img.gz",
+            "version": "test-cache",
+            "url": "https://example.invalid/openmanet.img.gz",
+            "sha256": "a" * 64,
+        },
+    )
+
+    payload = bridge.flash_plan_payload(
+        config="examples/three-node-field-mesh.yml",
+        node="point01",
+        device="/dev/disk4",
+    )
+
+    assert payload["image"]["cached_path"] == "/tmp/openmanet.img.gz"
+    assert payload["image"]["version"] == "test-cache"
+    assert payload["image"]["url"] == "https://example.invalid/openmanet.img.gz"
+    assert payload["image"]["sha256"] == "a" * 64
 
 
 def test_desktop_bridge_flash_returns_sudo_fallback_on_privilege_error(monkeypatch):
-    def fake_run_flash(**_kwargs):
-        print(bridge.PRIVILEGE_ERROR_MARKER)
-        raise typer.Exit(1)
+    def fake_run_flash_workflow(options, emit=None):
+        del options, emit
+        return SimpleNamespace(
+            to_dict=lambda include_events=False: {
+                "ok": False,
+                "code": FlashErrorCode.PRIVILEGE_REQUIRED.value,
+                "errors": ["Write access is required"],
+                "image": {"cached_path": "/tmp/openmanet.img.gz", "sha256": "a" * 64},
+            }
+        )
 
-    monkeypatch.setattr(bridge, "run_flash", fake_run_flash)
+    monkeypatch.setattr(bridge, "run_flash_workflow", fake_run_flash_workflow)
     monkeypatch.setattr(
         bridge,
-        "_flash_image_details",
+        "_safe_flash_image_details",
         lambda **_kwargs: {"cached_path": "/tmp/openmanet.img.gz", "sha256": "a" * 64},
     )
     monkeypatch.setattr(bridge.sys, "executable", "/Applications/EasyMANET.app/Contents/Resources/backend/easymanet-bridge/easymanet-bridge")
@@ -165,10 +355,126 @@ def test_desktop_bridge_flash_returns_sudo_fallback_on_privilege_error(monkeypat
     assert "--base-image /tmp/openmanet.img.gz --image-sha256 " + "a" * 64 in payload["sudo_command"]
 
 
+def test_desktop_bridge_sudo_fallback_preserves_unverified_custom_image(monkeypatch):
+    def fake_run_flash_workflow(options, emit=None):
+        del options, emit
+        return SimpleNamespace(
+            to_dict=lambda include_events=False: {
+                "ok": False,
+                "code": FlashErrorCode.PRIVILEGE_REQUIRED.value,
+                "errors": ["Write access is required"],
+                "image": {"path": "/tmp/custom-openmanet.img.gz", "sha256": ""},
+            }
+        )
+
+    monkeypatch.setattr(bridge, "run_flash_workflow", fake_run_flash_workflow)
+    monkeypatch.setattr(
+        bridge,
+        "_safe_flash_image_details",
+        lambda **_kwargs: {"cached_path": "/tmp/default.img.gz", "sha256": "b" * 64},
+    )
+
+    payload = bridge.flash_payload(
+        config="/Users/example/fleet.yml",
+        node="point01",
+        device="/dev/disk4",
+        yes=True,
+    )
+
+    assert "--base-image /tmp/custom-openmanet.img.gz" in payload["sudo_command"]
+    assert "--image-sha256" not in payload["sudo_command"]
+
+
+def test_desktop_bridge_flash_streams_events_and_final_result(monkeypatch, capsys):
+    def fake_run_flash_workflow(options, emit=None):
+        assert options.yes is True
+        assert emit is not None
+        emit(FlashEvent("write_started", "Writing image"))
+        return SimpleNamespace(
+            to_dict=lambda include_events=False: {
+                "ok": True,
+                "code": "ok",
+                "image": {"cached_path": "/tmp/openmanet.img.gz"},
+            }
+        )
+
+    monkeypatch.setattr(bridge, "run_flash_workflow", fake_run_flash_workflow)
+    monkeypatch.setattr(
+        bridge,
+        "_safe_flash_image_details",
+        lambda **_kwargs: {"cached_path": "/tmp/openmanet.img.gz"},
+    )
+
+    exit_code = bridge.main(
+        [
+            "flash",
+            "--config",
+            "examples/three-node-field-mesh.yml",
+            "--node",
+            "point01",
+            "--device",
+            "/dev/disk4",
+            "--yes",
+        ]
+    )
+
+    assert exit_code == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert lines[0]["type"] == "event"
+    assert lines[0]["event_type"] == "write_started"
+    assert lines[-1]["type"] == "result"
+    assert lines[-1]["ok"] is True
+    assert "events" not in lines[-1]
+
+
+def test_desktop_bridge_flash_uses_core_internal_result(monkeypatch, capsys):
+    def fake_run_flash_workflow(options, emit=None):
+        assert options.yes is True
+        assert emit is not None
+        return SimpleNamespace(
+            to_dict=lambda include_events=False: {
+                "ok": False,
+                "exit_code": 1,
+                "code": FlashErrorCode.INTERNAL.value,
+                "errors": ["Unexpected flash workflow error: OSError: download failed"],
+                "image": {},
+            }
+        )
+
+    monkeypatch.setattr(bridge, "run_flash_workflow", fake_run_flash_workflow)
+    monkeypatch.setattr(
+        bridge,
+        "_safe_flash_image_details",
+        lambda **_kwargs: {"target": "rpi4-mm6108-spi"},
+    )
+
+    exit_code = bridge.main(
+        [
+            "flash",
+            "--config",
+            "examples/three-node-field-mesh.yml",
+            "--node",
+            "point01",
+            "--device",
+            "/dev/disk4",
+            "--yes",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["type"] == "result"
+    assert payload["ok"] is False
+    assert payload["code"] == FlashErrorCode.INTERNAL.value
+    assert payload["errors"] == ["Unexpected flash workflow error: OSError: download failed"]
+
+
 def test_desktop_static_supports_electron_and_http_modes():
     root = Path(__file__).resolve().parents[1]
     index = root / "apps" / "desktop" / "src" / "easymanet_desktop" / "static" / "index.html"
     app_js = root / "apps" / "desktop" / "src" / "easymanet_desktop" / "static" / "app.js"
+    render_js = root / "apps" / "desktop" / "src" / "easymanet_desktop" / "static" / "render.js"
+    styles = root / "apps" / "desktop" / "src" / "easymanet_desktop" / "static" / "styles.css"
 
     assert 'href="styles.css"' in index.read_text()
     assert 'src="app.js"' in index.read_text()
@@ -177,16 +483,98 @@ def test_desktop_static_supports_electron_and_http_modes():
     assert "nativeApi.getState" in text
     assert "nativeApi.chooseConfig" in text
     assert "nativeApi.openFleetsFolder" in text
+    assert "nativeApi.discoverMesh" in text
     assert "nativeApi.flashPlan" in text
     assert "nativeApi.flash" in text
+    assert "nativeApi.onFlashEvent" in text
     assert "nativeApi.copyText" in text
     assert "fleet-select" in index.read_text()
     assert "open-fleets-folder" in index.read_text()
+    assert "app-shell" in index.read_text()
+    assert "sidebar-nav" in index.read_text()
+    assert 'data-tab-target="tab-flash"' in index.read_text()
+    assert 'data-tab-target="tab-mesh"' in index.read_text()
+    assert 'data-tab-panel' in index.read_text()
+    assert "mesh-discover" in index.read_text()
+    assert "mesh-radios" in index.read_text()
+    assert "mesh-ssh-user" not in index.read_text()
     assert "flash-panel" in index.read_text()
     assert "preview-flash" in index.read_text()
     assert "start-flash" in index.read_text()
+    assert "copy-flash-log" in index.read_text()
+    assert "role-default-ssh" in index.read_text()
+    assert "admin-password" in index.read_text()
+    assert 'value="default"' not in index.read_text()
+    assert '<select id="node-name" name="node" disabled>' in index.read_text()
+    assert '<input id="node-name"' not in index.read_text()
     assert "renderFleets" in text
+    assert "setupTabNavigation" in text
+    assert "activateTab" in text
+    assert "loadNodesForSelectedFleet" in text
+    assert "renderNodeOptions" in text
+    assert "discoverMesh" in text
+    assert "renderMeshDiscovery" in text
+    assert "applyRoleDefaultSsh" in text
+    assert "node_roles" in text
+    assert "node_access" in text
+    assert "flashAccessHint" in text
+    assert "includeAdminPassword" in text
+    assert "adminPassword" in text
+    assert "detectMacPlatform" in text
+    assert "classList.toggle" in text
+    assert "flash-busy" in text
+    assert "startDiskWatcher" in text
+    assert "refreshDisksIfChanged" in text
+    assert "diskInventorySignature" in text
+    assert "visibilitychange" in text
+    assert "setInterval(refreshDisksIfChanged" in text
+    assert "updateCopyFlashLogVisibility" in text
     assert "flashPanel.hidden = true" in text
+    assert "safeTone" in render_js.read_text()
+    assert "meshRadioCard" in render_js.read_text()
+    assert "meshTopologyView" in render_js.read_text()
+    assert "meshDiscoveryMarkup" in render_js.read_text()
+    assert "ALLOWED_TONES" in render_js.read_text()
+    assert '["ok", "warn", "bad", "subtle"]' in render_js.read_text()
+    assert "body.flash-busy .appbar" in styles.read_text()
+    assert "mesh-grid" in styles.read_text()
+    assert "topology-view" in styles.read_text()
+    assert "topology-link" in styles.read_text()
+    assert "@media print" in styles.read_text()
+
+
+def test_desktop_renderer_safe_tone_allows_only_expected_classes():
+    root = Path(__file__).resolve().parents[1]
+    render_js = root / "apps" / "desktop" / "src" / "easymanet_desktop" / "static" / "render.js"
+    script = """
+const fs = require("node:fs");
+const vm = require("node:vm");
+const context = { window: {} };
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
+const { safeTone } = context.window.EMRender;
+const valid = ["ok", "warn", "bad", "subtle"];
+const invalid = ["danger", "<script>", null, undefined, "ok bad"];
+process.stdout.write(JSON.stringify({
+  valid: Object.fromEntries(valid.map((tone) => [tone, safeTone(tone)])),
+  invalid: invalid.map((tone) => safeTone(tone)),
+}));
+"""
+    result = subprocess.run(
+        ["node", "-e", script, str(render_js)],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+
+    assert payload["valid"] == {
+        "ok": "ok",
+        "warn": "warn",
+        "bad": "bad",
+        "subtle": "subtle",
+    }
+    assert payload["invalid"] == ["subtle"] * 5
 
 
 def test_desktop_static_containment_rejects_sibling_prefix(tmp_path):
@@ -205,17 +593,48 @@ def test_electron_shell_files_exist():
     assert (electron / "package.json").exists()
     assert (electron / "electron-builder.yml").exists()
     assert (electron / "main.js").exists()
+    assert (electron / "path-utils.js").exists()
     assert (electron / "preload.js").exists()
     assert bridge_runner.exists()
     assert "loadFile(indexHtmlPath())" in (electron / "main.js").read_text()
     assert "contextBridge.exposeInMainWorld" in (electron / "preload.js").read_text()
     assert "easymanet:open-fleets-folder" in (electron / "main.js").read_text()
+    assert "easymanet:mesh-discover" in (electron / "main.js").read_text()
     assert "easymanet:flash-plan" in (electron / "main.js").read_text()
     assert "easymanet:flash" in (electron / "main.js").read_text()
+    assert "easymanet:flash-event" in (electron / "main.js").read_text()
+    assert "resolveConfigPath(config, {" in (electron / "main.js").read_text()
+    assert "fleetPathCandidates" not in (electron / "main.js").read_text()
+    assert "fleetExtensions" not in (electron / "main.js").read_text()
+    path_utils_text = (electron / "path-utils.js").read_text()
+    assert "resolveConfigPath" in path_utils_text
+    assert "hasTraversalSegment" in path_utils_text
+    assert "resolve-config" in path_utils_text
+    assert "resolveConfigPath(\"field\"" in (electron / "scripts" / "check-electron.js").read_text()
     assert "flashBridgeTimeoutMs" in (electron / "main.js").read_text()
+    assert "runBridgeStreaming" in (electron / "main.js").read_text()
+    assert "fullStdout" in (electron / "main.js").read_text()
+    assert "isDestroyed" in (electron / "main.js").read_text()
+    assert "runFlashWithAdministratorPrivileges" in (electron / "main.js").read_text()
+    assert '"sudo"' in (electron / "main.js").read_text()
+    assert '"-S"' in (electron / "main.js").read_text()
+    assert "stageElevatedFlashInputs" in (electron / "main.js").read_text()
+    assert "baseImageArgs(stagedImage)" in (electron / "main.js").read_text()
+    assert "cleanupElevatedStage(options.stage);\n      resolve({ ok: false" in (electron / "main.js").read_text()
+    assert "const effectiveTimeoutMs = timeoutMs + 60000" in (electron / "main.js").read_text()
+    assert "after ${effectiveTimeoutMs / 1000}s" in (electron / "main.js").read_text()
+    assert "EasyMANET Flash Helper.app" not in (electron / "main.js").read_text()
+    assert 'spawn(sudo.command, sudo.args' in (electron / "main.js").read_text()
+    assert "Mac administrator password is required for flashing" in (electron / "main.js").read_text()
+    assert "with administrator privileges" not in (electron / "main.js").read_text()
+    assert 'spawn("osascript"' not in (electron / "main.js").read_text()
+    assert "streamEvents" not in (electron / "main.js").read_text()
     assert "copyText" in (electron / "preload.js").read_text()
+    assert "discoverMesh" in (electron / "preload.js").read_text()
+    assert "onFlashEvent" in (electron / "preload.js").read_text()
     assert "EASYMANET_ELECTRON_NO_SOURCE_PATHS" in (electron / "main.js").read_text()
     assert "bridgeTimeoutMs" in (electron / "main.js").read_text()
+    assert "meshBridgeTimeoutMs" in (electron / "main.js").read_text()
     assert "process.resourcesPath" in (electron / "main.js").read_text()
     assert "desktop-static" in (electron / "main.js").read_text()
     assert "EASYMANET_BRIDGE_BIN is a development/testing override" in (electron / "main.js").read_text()
@@ -226,5 +645,5 @@ def test_electron_shell_files_exist():
     assert 'candidates.push("python", "py")' in runner_text
     assert 'process.env.PYTHON' in runner_text
     build_text = (electron / "scripts" / "build-bridge.py").read_text()
-    assert '"easymanet_cli"' in build_text
-    assert 'ROOT / "apps" / "cli" / "src"' in build_text
+    assert '"easymanet_cli"' not in build_text
+    assert 'ROOT / "apps" / "cli" / "src"' not in build_text
