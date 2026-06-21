@@ -12,6 +12,7 @@ from easymanet.download import (
     get_cached_image,
     image_sha256,
     images_manifest_path,
+    normalize_sha256,
     version_file_path,
 )
 from easymanet.manifest import ManifestError, load_manifest
@@ -21,6 +22,7 @@ from easymanet.validate import validate
 from easymanet.workspace import FLEET_SUFFIXES, resolve_fleet_config, workspace_payload
 
 MANAGEMENT_LAN_IP = "10.41.254.1"
+DISPLAY_CACHE_HASH_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def state_payload() -> dict[str, Any]:
@@ -29,14 +31,32 @@ def state_payload() -> dict[str, Any]:
     versions = cached_versions()
     for target, entry in images.items():
         cached = get_cached_image(target)
+        cached_version = versions.get(target, {})
+        known_sha256 = cached_version.get("sha256") or entry.get("sha256")
         if not cached:
             cached = display_cached_image(target, entry)
+            known_sha256 = entry.get("sha256") if isinstance(entry.get("sha256"), str) else ""
         entry["cached_path"] = str(cached) if cached else ""
-        cached_version = versions.get(target, {})
         if cached_version.get("version") and not entry.get("version"):
             entry["version"] = cached_version["version"]
+        for key in (
+            "trust_status",
+            "source",
+            "channel",
+            "release_tag",
+            "image_status",
+            "manifest_url",
+        ):
+            if cached_version.get(key) and not entry.get(key):
+                entry[key] = cached_version[key]
+        if cached_version.get("warnings") and not entry.get("warnings"):
+            entry["warnings"] = cached_version["warnings"]
         if cached:
-            add_cached_image_details(entry, cached)
+            add_cached_image_details(
+                entry,
+                cached,
+                known_sha256=known_sha256,
+            )
     return {
         "ok": True,
         "workspace": workspace,
@@ -62,7 +82,7 @@ def configured_images() -> dict[str, dict[str, Any]]:
     } or {"rpi4-mm6108-spi": {}}
 
 
-def cached_versions() -> dict[str, dict[str, str]]:
+def cached_versions() -> dict[str, dict[str, Any]]:
     path = version_file_path()
     if not path.exists():
         return {}
@@ -72,7 +92,7 @@ def cached_versions() -> dict[str, dict[str, str]]:
         return {}
     if not isinstance(data, dict):
         return {}
-    versions: dict[str, dict[str, str]] = {}
+    versions: dict[str, dict[str, Any]] = {}
     for target, entry in data.items():
         if isinstance(entry, str):
             versions[str(target)] = {"version": entry}
@@ -82,12 +102,22 @@ def cached_versions() -> dict[str, dict[str, str]]:
                 for key, value in entry.items()
                 if isinstance(value, str)
             }
+            warnings = entry.get("warnings")
+            if isinstance(warnings, list):
+                versions[str(target)]["warnings"] = [
+                    str(item) for item in warnings if isinstance(item, str)
+                ]
     return versions
 
 
 def display_cached_image(target: str, entry: dict[str, Any]) -> Path | None:
-    if entry.get("sha256"):
-        return None
+    manifest_sha = entry.get("sha256")
+    if isinstance(manifest_sha, str):
+        try:
+            normalize_sha256(manifest_sha)
+            return None
+        except ValueError:
+            pass
     candidates = sorted(
         cache_dir().glob(f"*{target}*"),
         key=_path_mtime,
@@ -99,11 +129,26 @@ def display_cached_image(target: str, entry: dict[str, Any]) -> Path | None:
     return None
 
 
-def add_cached_image_details(entry: dict[str, Any], cached: Path) -> None:
+def add_cached_image_details(
+    entry: dict[str, Any],
+    cached: Path,
+    *,
+    known_sha256: str = "",
+) -> None:
     try:
-        entry["cached_size_bytes"] = cached.stat().st_size
+        size = cached.stat().st_size
     except OSError:
-        entry["cached_size_bytes"] = 0
+        size = 0
+    entry["cached_size_bytes"] = size
+    if known_sha256:
+        try:
+            entry["cached_sha256"] = normalize_sha256(known_sha256)
+            return
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if size > DISPLAY_CACHE_HASH_LIMIT_BYTES:
+        entry["cached_sha256"] = ""
+        return
     try:
         entry["cached_sha256"] = image_sha256(cached)
     except OSError:
@@ -131,7 +176,7 @@ def _path_mtime(path: Path) -> float:
 def disks_payload(*, include_all: bool) -> dict[str, Any]:
     try:
         check_platform()
-        disks = [disk for disk in list_disks(include_all=include_all) if disk.mounted]
+        disks = list_disks(include_all=include_all)
     except Exception as exc:  # noqa: BLE001 - surfaced to the local UI as data.
         return {"ok": False, "errors": [str(exc)], "disks": []}
     return {
@@ -188,6 +233,12 @@ def node_access(manifest: Any) -> dict[str, dict[str, Any]]:
         try:
             resolved = resolve_node_model(manifest, name)
         except Exception:  # noqa: BLE001 - invalid fleets already surface validation errors.
+            access[name] = {
+                "role": "",
+                "local_ap_enabled": False,
+                "local_ap_ssid": "",
+                "management_ip": MANAGEMENT_LAN_IP,
+            }
             continue
         local_ap = resolved.local_ap
         access[name] = {

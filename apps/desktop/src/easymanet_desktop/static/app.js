@@ -1,5 +1,5 @@
 // Controller for the EasyMANET operator console.
-// Markup builders live in render.js (EMRender); this file owns state and wiring.
+// Markup builders live in render.js (EMRender); this file owns UI workflow wiring.
 const {
   escapeHtml,
   formatBytes,
@@ -11,30 +11,21 @@ const {
   meshTopologyView,
 } = window.EMRender;
 
-const state = {
-  configPath: "",
-  nodeName: "",
-  diskDevice: "",
-  sudoCommand: "",
-  nodeLoadSeq: 0,
-  nodeRoles: {},
-  nodeAccess: {},
-  images: {},
-  diskSignature: "",
-  diskLoadInFlight: false,
-  flashBusy: false,
-  lastFlashOk: false,
-  meshBusy: false,
-  meshHasScanned: false,
-  meshNodes: [],
-  meshLinks: [],
-  flashSignature: "",
-  planSignature: "",
-  planImageSummary: "",
-  logLines: [],
-};
+const state = window.EMState;
+const { byId: $, detectMacPlatform } = window.EMDom;
+const { nativeApi, postJson, errorDetail, errorMessage, getState, getDisks } = window.EMApi;
+const { uniqueNodeNames, roleSshHint } = window.EMFleet;
+const { diskInventorySignature } = window.EMDisk;
+const {
+  normalizeSshMode,
+  sshModeLabel,
+  flashAccessHint: flashAccessHintForAccess,
+  imageReadinessSummary,
+  imagesFullyCached,
+  planImageSummary,
+} = window.EMFlashUi;
+const { emptyMeshMarkup } = window.EMMesh;
 
-const $ = (id) => document.getElementById(id);
 const workspacePath = $("workspace-path");
 const fleetFolder = $("fleet-folder");
 const fleetEmpty = $("fleet-empty");
@@ -69,6 +60,7 @@ const adminPasswordRow = $("admin-password-row");
 const adminPasswordInput = $("admin-password");
 const previewFlash = $("preview-flash");
 const startFlash = $("start-flash");
+const exportSupportBundle = $("export-support-bundle");
 const flashStatus = $("flash-status");
 const flashStatusText = $("flash-status-text");
 const flashProgress = $("flash-progress");
@@ -84,9 +76,21 @@ const meshStatusChip = $("mesh-status-chip");
 const meshConfigSource = $("mesh-config-source");
 const meshScanSubnet = $("mesh-scan-subnet");
 const meshDiscover = $("mesh-discover");
+const meshScanning = $("mesh-scanning");
+const meshScanningDetail = $("mesh-scanning-detail");
 const meshSummary = $("mesh-summary");
 const meshCount = $("mesh-count");
 const meshRadios = $("mesh-radios");
+const diagnosticsForm = $("diagnostics-form");
+const diagnosticsStatusChip = $("diagnostics-status-chip");
+const diagnosticsConfigSource = $("diagnostics-config-source");
+const diagnosticsRun = $("diagnostics-run");
+const diagnosticsExport = $("diagnostics-export");
+const diagnosticsImportSource = $("diagnostics-import-source");
+const diagnosticsImport = $("diagnostics-import");
+const diagnosticsResult = $("diagnostics-result");
+const diagnosticsOutput = $("diagnostics-output");
+const diagnosticsCopy = $("diagnostics-copy");
 const steps = {
   fleet: $("step-fleet"),
   node: $("step-node"),
@@ -96,7 +100,6 @@ const steps = {
 const tabButtons = Array.from(document.querySelectorAll("[data-tab-target]"));
 const tabPanels = Array.from(document.querySelectorAll("[data-tab-panel]"));
 
-const nativeApi = window.easymanet || null;
 const isMac = detectMacPlatform();
 const diskWatchIntervalMs = 2500;
 let diskWatchTimer = null;
@@ -117,6 +120,7 @@ $("refresh").addEventListener("click", () => {
 fleetSelect.addEventListener("change", () => {
   if (fleetSelect.value) {
     configInput.value = fleetSelect.value;
+    resetMeshDiscovery();
     updateMeshFleetSource();
     loadNodesForSelectedFleet().catch(handleNodeLoadError);
     updateFlashControls();
@@ -125,11 +129,13 @@ fleetSelect.addEventListener("change", () => {
 configInput.addEventListener("input", () => {
   state.nodeLoadSeq += 1;
   resetNodeSelect("Update fleet path to load nodes");
+  resetMeshDiscovery();
   updateMeshFleetSource();
   updateFlashControls();
 });
 configInput.addEventListener("change", () => {
   syncFleetSelect(configInput.value.trim());
+  resetMeshDiscovery();
   updateMeshFleetSource();
   loadNodesForSelectedFleet().catch(handleNodeLoadError);
 });
@@ -209,6 +215,7 @@ startFlash.addEventListener("click", async () => {
   try {
     const response = await nativeApi.flash(flashPayload({ includeAdminPassword: true }));
     renderFlash(response);
+    await refreshImageSidebar();
     await loadDisks().catch(renderDiskError);
   } catch (error) {
     hideProgress();
@@ -238,9 +245,41 @@ copyFlashLog.addEventListener("click", async () => {
     showCopied(copyFlashLog, "Copy Log");
   }
 });
+exportSupportBundle.addEventListener("click", async () => {
+  const payload = {
+    config: state.configPath || configInput.value.trim(),
+    node: state.nodeName || nodeSelect.value.trim(),
+    include_disks: true,
+    includeDisks: true,
+  };
+  try {
+    const result = await postJson("/api/support/bundle", payload);
+    if (result.ok) {
+      appendLog("success", `Support bundle exported: ${result.path}`);
+      setFlashStatus("ok", "Support bundle exported.");
+    } else if (!result.canceled) {
+      setFlashStatus("bad", (result.errors || [])[0] || "Support bundle export failed");
+    }
+  } catch (error) {
+    setFlashStatus("bad", errorMessage(error));
+  }
+});
 meshDiscoveryForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await discoverMesh();
+});
+diagnosticsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await runDiagnostics();
+});
+diagnosticsExport.addEventListener("click", async () => {
+  await exportDiagnosticsBundle();
+});
+diagnosticsImport.addEventListener("click", async () => {
+  await importOfflineBootReport();
+});
+diagnosticsCopy.addEventListener("click", async () => {
+  await copyDiagnosticsSummary();
 });
 $("validate-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -283,15 +322,43 @@ async function loadState() {
     workspacePath.textContent = workspace.root || "";
     workspacePath.title = workspace.root || "";
     await renderFleets(workspace.fleet_files || [], workspace.fleets_dir || "");
-    const entries = Object.entries(payload.images || {});
-    state.images = payload.images || {};
-    imageCount.textContent = `${entries.length}`;
-    images.innerHTML = entries.map(([target, image]) => imageItem(target, image)).join("");
+    renderImageState(payload.images || {});
     updateMeshFleetSource();
     updateFlashControls();
   } catch (error) {
     console.error("State refresh failed", error);
     renderStateError(error);
+  }
+}
+
+function renderImageState(imagePayload) {
+  const entries = Object.entries(imagePayload || {});
+  state.images = imagePayload || {};
+  imageCount.textContent = `${entries.length}`;
+  images.innerHTML = entries.map(([target, image]) => imageItem(target, image)).join("");
+}
+
+async function refreshImageSidebar() {
+  if (state.imageLoadInFlight) {
+    state.imageRefreshQueued = true;
+    return;
+  }
+  state.imageLoadInFlight = true;
+  try {
+    const payload = await getState();
+    if (!payload.ok) {
+      throw new Error(errorDetail(payload) || "Could not refresh image state");
+    }
+    renderImageState(payload.images || {});
+    updateFlashControls();
+  } catch (error) {
+    console.debug("Image sidebar refresh failed", error);
+  } finally {
+    state.imageLoadInFlight = false;
+    if (state.imageRefreshQueued) {
+      state.imageRefreshQueued = false;
+      refreshImageSidebar();
+    }
   }
 }
 
@@ -310,6 +377,8 @@ async function refreshDisks({ renderIfUnchanged, reportErrors }) {
       if (reportErrors) {
         disks.innerHTML = `<div class="inline-error">${escapeHtml((payload.errors || []).join("\n"))}</div>`;
       }
+      state.diskDevice = "";
+      updateFlashControls();
       return;
     }
     const signature = diskInventorySignature(payload.disks || []);
@@ -342,21 +411,6 @@ function renderDisksPayload(payload, signature = diskInventorySignature(payload.
   }
   disks.innerHTML = diskRecords.map((disk) => diskCard(disk, state.diskDevice)).join("");
   updateFlashControls();
-}
-
-function diskInventorySignature(diskRecords) {
-  return JSON.stringify(
-    [...diskRecords]
-      .map((disk) => ({
-        device: disk.device || "",
-        model: disk.model || "",
-        mounted: [...(disk.mounted || [])].sort(),
-        removable: Boolean(disk.removable),
-        size: disk.size_human || "",
-        warnings: [...(disk.warnings || [])].sort(),
-      }))
-      .sort((left, right) => left.device.localeCompare(right.device))
-  );
 }
 
 function renderValidation(payload) {
@@ -441,7 +495,7 @@ async function loadNodesForSelectedFleet(preferredNode = "") {
 }
 
 function renderNodeOptions(nodes, preferredNode = "", nodeRoles = {}, nodeAccess = {}) {
-  const uniqueNodes = [...new Set((nodes || []).map((node) => String(node).trim()).filter(Boolean))];
+  const uniqueNodes = uniqueNodeNames(nodes);
   state.nodeRoles = { ...nodeRoles };
   state.nodeAccess = { ...nodeAccess };
   nodeSelect.replaceChildren();
@@ -488,6 +542,7 @@ async function discoverMesh() {
   state.meshHasScanned = true;
   setMeshBusy(true);
   meshSummary.hidden = true;
+  meshRadios.setAttribute("aria-busy", "true");
   setMeshStatus("warn", "scanning");
   try {
     const response = await postJson("/api/mesh/discover", {
@@ -498,6 +553,7 @@ async function discoverMesh() {
   } catch (error) {
     renderMeshDiscovery({ ok: false, errors: [errorMessage(error)], nodes: [], links: [], candidates_checked: 0 });
   } finally {
+    meshRadios.removeAttribute("aria-busy");
     setMeshBusy(false);
   }
 }
@@ -514,23 +570,36 @@ function renderMeshDiscovery(payload) {
   if (nodes.length) {
     meshRadios.className = "topology-view";
     meshRadios.innerHTML = meshTopologyView(payload);
-    setMeshStatus("ok", `${nodes.length} nodes`);
+    setMeshStatus(payload.ok ? "ok" : "warn", payload.ok ? `${nodes.length} nodes` : "partial results");
   } else {
     meshRadios.className = "mesh-grid";
-    meshRadios.innerHTML = `
-      <div class="empty-state slim">
-        <p class="empty-title">No topology found</p>
-        <p class="empty-meta">No EasyMANET gateway API answered.</p>
-      </div>
-    `;
+    meshRadios.innerHTML = emptyMeshMarkup("No topology found", "No EasyMANET gateway API answered.");
     setMeshStatus(payload.ok ? "subtle" : "bad", payload.ok ? "none found" : "error");
   }
+}
+
+function resetMeshDiscovery() {
+  state.meshHasScanned = false;
+  state.meshNodes = [];
+  state.meshLinks = [];
+  meshCount.textContent = "0";
+  meshSummary.hidden = true;
+  meshSummary.innerHTML = "";
+  meshRadios.className = "mesh-grid";
+  meshRadios.innerHTML = emptyMeshMarkup("No topology found", "Run Scan Mesh to refresh this view.");
+  setMeshStatus("subtle", "idle");
 }
 
 function setMeshBusy(busy) {
   state.meshBusy = busy;
   meshDiscover.disabled = busy;
+  meshDiscover.textContent = busy ? "Scanning..." : "Scan Mesh";
+  meshDiscover.setAttribute("aria-busy", busy ? "true" : "false");
   meshScanSubnet.disabled = busy;
+  meshScanning.hidden = !busy;
+  meshScanningDetail.textContent = meshScanSubnet.checked
+    ? "Checking gateway APIs, fleet nodes, and local network candidates."
+    : "Checking gateway APIs and fleet node candidates.";
   if (busy) {
     setMeshStatus("warn", "scanning");
   }
@@ -545,6 +614,108 @@ function updateMeshFleetSource() {
   const config = configInput.value.trim();
   meshConfigSource.textContent = config || "No fleet selected";
   meshConfigSource.title = config || "";
+  diagnosticsConfigSource.textContent = config || "No fleet selected";
+  diagnosticsConfigSource.title = config || "";
+}
+
+async function runDiagnostics() {
+  setDiagnosticsBusy(true, "running");
+  try {
+    const response = await postJson("/api/diagnostics/run", {
+      config: configInput.value.trim(),
+    });
+    renderDiagnostics(response);
+  } catch (error) {
+    renderDiagnosticsError(error);
+  } finally {
+    setDiagnosticsBusy(false);
+  }
+}
+
+async function exportDiagnosticsBundle() {
+  setDiagnosticsBusy(true, "exporting");
+  try {
+    const response = await postJson("/api/diagnostics/bundle", {
+      config: configInput.value.trim(),
+    });
+    renderDiagnostics(response);
+    if (response.bundle_path) {
+      renderDiagnosticsResult({ ok: true, message: `Support bundle: ${response.bundle_path}` });
+    }
+  } catch (error) {
+    renderDiagnosticsError(error);
+  } finally {
+    setDiagnosticsBusy(false);
+  }
+}
+
+async function importOfflineBootReport() {
+  const source = diagnosticsImportSource.value.trim();
+  if (!source) {
+    renderDiagnosticsResult({ ok: false, message: "Boot report source path is required." });
+    return;
+  }
+  setDiagnosticsBusy(true, "importing");
+  try {
+    const response = await postJson("/api/diagnostics/import-boot-report", { source });
+    const count = (response.imported || []).length;
+    renderDiagnosticsResult({
+      ok: Boolean(response.ok),
+      message: response.ok ? `Imported ${count} boot report folder(s).` : errorDetail(response),
+    });
+  } catch (error) {
+    renderDiagnosticsError(error);
+  } finally {
+    setDiagnosticsBusy(false);
+  }
+}
+
+async function copyDiagnosticsSummary() {
+  const text = diagnosticsOutput.textContent.trim();
+  if (!nativeApi || !text) {
+    return;
+  }
+  const result = await nativeApi.copyText(text);
+  if (result.ok) {
+    showCopied(diagnosticsCopy, "Copy Summary");
+  } else {
+    renderDiagnosticsResult({ ok: false, message: errorDetail(result) || "Could not copy support summary." });
+  }
+}
+
+function renderDiagnostics(payload) {
+  const summary = payload.summary || "";
+  diagnosticsOutput.textContent = summary || JSON.stringify(payload, null, 2);
+  setDiagnosticsStatus(payload.ok ? "ok" : "warn", payload.support_code || (payload.ok ? "ready" : "issues"));
+  renderDiagnosticsResult({
+    ok: Boolean(payload.ok),
+    message: payload.bundle_path ? `Support bundle: ${payload.bundle_path}` : payload.support_code || "Diagnostics complete",
+  });
+}
+
+function renderDiagnosticsError(error) {
+  const message = errorMessage(error);
+  setDiagnosticsStatus("bad", "error");
+  renderDiagnosticsResult({ ok: false, message });
+}
+
+function renderDiagnosticsResult(payload) {
+  diagnosticsResult.hidden = false;
+  diagnosticsResult.className = `validation ${payload.ok ? "ok" : "bad"}`;
+  diagnosticsResult.textContent = payload.message || "";
+}
+
+function setDiagnosticsBusy(busy, label = "running") {
+  diagnosticsRun.disabled = busy;
+  diagnosticsExport.disabled = busy;
+  diagnosticsImport.disabled = busy;
+  diagnosticsCopy.disabled = busy;
+  setDiagnosticsStatus(busy ? "warn" : "subtle", busy ? label : "idle");
+}
+
+function setDiagnosticsStatus(tone, label) {
+  diagnosticsStatusChip.textContent = label;
+  diagnosticsStatusChip.className = `chip ${tone}`;
 }
 
 function flashPayload(options = {}) {
@@ -565,18 +736,11 @@ function flashPayload(options = {}) {
 function selectedSshMode() {
   const checked = document.querySelector("input[name='ssh-mode']:checked");
   const value = checked ? checked.value : "auto";
-  return value === "auto" ? "default" : value;
+  return normalizeSshMode(value);
 }
 
 function selectedSshLabel() {
-  const mode = selectedSshMode();
-  if (mode === "enable") {
-    return "On";
-  }
-  if (mode === "disable") {
-    return "Off";
-  }
-  return `Auto (${sshAutoHint.textContent || "role default"})`;
+  return sshModeLabel(selectedSshMode(), sshAutoHint.textContent || "role default");
 }
 
 function applyRoleDefaultSsh() {
@@ -594,14 +758,8 @@ function selectedNodeAccess(node = nodeSelect.value.trim()) {
   return node ? state.nodeAccess[node] || {} : {};
 }
 
-function flashAccessHint(node) {
-  const access = selectedNodeAccess(node);
-  const address = access.management_ip || "10.41.254.1";
-  const ssid = access.local_ap_enabled && access.local_ap_ssid ? access.local_ap_ssid : "";
-  if (ssid) {
-    return `Join ${ssid} or connect Ethernet, then SSH to root@${address}.`;
-  }
-  return `Connect to the node management network, then SSH to root@${address}.`;
+function flashAccessHint(node, payload = {}) {
+  return flashAccessHintForAccess(selectedNodeAccess(node), payload);
 }
 
 function updateRoleDefaultSsh() {
@@ -611,7 +769,7 @@ function updateRoleDefaultSsh() {
     nodeRoleChip.hidden = true;
     return;
   }
-  sshAutoHint.textContent = role === "gate" ? "on for gate" : `off for ${role}`;
+  sshAutoHint.textContent = roleSshHint(role);
   nodeRoleChip.textContent = role;
   nodeRoleChip.hidden = false;
 }
@@ -689,47 +847,18 @@ function updateFlashReview({ node, ready, needsPassword, label, tone }) {
   reviewNode.textContent = node || "Select a node";
   reviewDisk.textContent = state.diskDevice || "Select a disk";
   reviewSsh.textContent = selectedSshLabel();
-  reviewImage.textContent = state.planImageSummary || imageReadinessSummary();
+  reviewImage.textContent = state.planImageSummary || imageReadinessSummary(state.images);
   eraseWarning.hidden = !state.diskDevice;
   reviewStatus.textContent = label;
   reviewStatus.className = `chip ${tone}`;
   reviewNode.classList.toggle("pending", !node);
   reviewDisk.classList.toggle("pending", !state.diskDevice);
-  reviewImage.classList.toggle("pending", !state.planImageSummary && !imagesFullyCached());
+  reviewImage.classList.toggle("pending", !state.planImageSummary && !imagesFullyCached(state.images));
   reviewSsh.classList.remove("pending");
   if (ready && !needsPassword && !state.flashBusy) {
     reviewStatus.textContent = state.planImageSummary ? "reviewed" : "ready";
     reviewStatus.className = `chip ${state.planImageSummary ? "ok" : tone}`;
   }
-}
-
-function imageReadinessSummary() {
-  const entries = Object.entries(state.images || {});
-  if (!entries.length) {
-    return "No image targets found";
-  }
-  const missing = entries.filter(([, image]) => !image || !image.cached_path);
-  if (!missing.length) {
-    return entries.length === 1 ? "Image cache ready" : `${entries.length} image targets cached`;
-  }
-  const label = missing.length === 1 ? "target" : "targets";
-  return `${missing.length} image ${label} will download during preview or flash`;
-}
-
-function imagesFullyCached() {
-  const entries = Object.values(state.images || {});
-  return Boolean(entries.length) && entries.every((image) => image && image.cached_path);
-}
-
-function planImageSummary(payload) {
-  const image = payload.image || {};
-  const plan = payload.plan || {};
-  const imagePath = image.cached_path || plan.base_image || image.url || "";
-  const version = image.version ? ` ${image.version}` : "";
-  if (imagePath) {
-    return `Plan confirmed${version}: ${imagePath}`;
-  }
-  return "Plan confirmed exact image";
 }
 
 function updateDiskMode() {
@@ -767,11 +896,6 @@ function activateTab(tabId) {
     panel.hidden = !selected;
     panel.classList.toggle("active", selected);
   }
-  if (tabId === "tab-mesh" && nativeApi && !state.meshHasScanned && !state.meshBusy) {
-    discoverMesh().catch((error) => {
-      renderMeshDiscovery({ ok: false, errors: [errorMessage(error)], nodes: [], links: [], candidates_checked: 0 });
-    });
-  }
 }
 
 function startDiskWatcher() {
@@ -807,12 +931,6 @@ function setBusy(busy) {
   state.flashBusy = busy;
   document.body.classList.toggle("flash-busy", busy);
   updateFlashControls();
-}
-
-function detectMacPlatform() {
-  const nav = window.navigator || {};
-  const platform = String(nav.userAgentData?.platform || nav.platform || nav.userAgent || "").toLowerCase();
-  return platform.includes("mac");
 }
 
 function setFlashStatus(tone, message) {
@@ -904,6 +1022,9 @@ function renderFlashEvent(event) {
     });
     return;
   }
+  if (type === "download_completed") {
+    refreshImageSidebar();
+  }
   if (type === "dd_progress") {
     const written = Number(event.bytes);
     setProgress({
@@ -977,7 +1098,7 @@ function renderFlash(payload) {
   }
   if (payload.ok) {
     const node = payload.node || state.nodeName || "the node";
-    const hint = flashAccessHint(node);
+    const hint = flashAccessHint(node, payload);
     state.flashSignature = currentFlashSignature();
     state.lastFlashOk = true;
     appendLog("success", "Flash complete.");
@@ -990,66 +1111,6 @@ function renderFlash(payload) {
   }
   updateFlashControls();
   updateCopyFlashLogVisibility();
-}
-
-async function getJson(url) {
-  if (nativeApi && url === "/api/state") {
-    return nativeApi.getState();
-  }
-  return fetchJson(url);
-}
-
-async function postJson(url, body) {
-  if (nativeApi && url === "/api/validate") {
-    return nativeApi.validate(body);
-  }
-  if (nativeApi && nativeApi.discoverMesh && url === "/api/mesh/discover") {
-    return nativeApi.discoverMesh(body);
-  }
-  return fetchJson(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-}
-
-async function fetchJson(url, options) {
-  let response;
-  try {
-    response = await fetch(url, options);
-  } catch (error) {
-    throw new Error(`Request failed for ${url}: ${error.message}`);
-  }
-
-  const text = await response.text();
-  let payload = {};
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch (error) {
-      throw new Error(`Invalid JSON from ${url}: ${error.message}`);
-    }
-  }
-
-  if (!response.ok) {
-    const detail = errorDetail(payload) || text;
-    const suffix = detail ? ` - ${detail}` : "";
-    throw new Error(`Request failed for ${url}: ${response.status} ${response.statusText}${suffix}`);
-  }
-  return payload;
-}
-
-function errorDetail(payload) {
-  if (!payload || typeof payload !== "object") {
-    return "";
-  }
-  if (payload.error) {
-    return payload.error;
-  }
-  if (Array.isArray(payload.errors)) {
-    return payload.errors.join(", ");
-  }
-  return "";
 }
 
 function handleRefreshError(error) {
@@ -1076,6 +1137,8 @@ function renderStateError(error) {
 
 function renderDiskError(error) {
   disks.innerHTML = `<div class="inline-error">${escapeHtml(errorMessage(error))}</div>`;
+  state.diskDevice = "";
+  selectedDisk.textContent = "None";
   updateFlashControls();
 }
 
@@ -1091,22 +1154,6 @@ function handleNodeLoadError(error) {
   resetNodeSelect("Could not load nodes");
   renderValidation({ ok: false, errors: [errorMessage(error)] });
   updateFlashControls();
-}
-
-function errorMessage(error) {
-  return error && error.message ? error.message : String(error);
-}
-
-async function getState() {
-  return getJson("/api/state");
-}
-
-async function getDisks(includeAll) {
-  if (nativeApi) {
-    return nativeApi.getDisks(includeAll);
-  }
-  const suffix = includeAll ? "?all=1" : "";
-  return getJson(`/api/disks${suffix}`);
 }
 
 updateRoleDefaultSsh();

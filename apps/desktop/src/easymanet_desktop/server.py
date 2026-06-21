@@ -13,6 +13,9 @@ from urllib.parse import parse_qs, urlparse
 
 import typer
 
+from easymanet.diagnostics import export_support_bundle, import_boot_report, run_diagnostics
+from easymanet.support_bundle import create_support_bundle
+
 from .mesh import mesh_discover_payload
 from .payloads import disks_payload, state_payload, validate_payload
 
@@ -76,17 +79,42 @@ class _DesktopHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/validate", "/api/mesh/discover"}:
+        if parsed.path not in {
+            "/api/validate",
+            "/api/mesh/discover",
+            "/api/support/bundle",
+            "/api/diagnostics/run",
+            "/api/diagnostics/bundle",
+            "/api/diagnostics/import-boot-report",
+        }:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
             payload = self._read_json()
             if parsed.path == "/api/mesh/discover":
                 self._send_json(mesh_discover_payload(payload))
+            elif parsed.path == "/api/support/bundle":
+                self._send_json(
+                    create_support_bundle(
+                        config=str(payload.get("config") or ""),
+                        node=str(payload.get("node") or ""),
+                        boot_report=str(payload.get("boot_report") or ""),
+                        output=str(payload.get("output") or ""),
+                        include_disks=_bool_payload(payload.get("include_disks", False)),
+                    ).to_dict()
+                )
+            elif parsed.path == "/api/diagnostics/run":
+                self._send_json(run_diagnostics(config=str(payload.get("config", "") or "")))
+            elif parsed.path == "/api/diagnostics/bundle":
+                self._send_json(export_support_bundle(config=str(payload.get("config", "") or "")))
+            elif parsed.path == "/api/diagnostics/import-boot-report":
+                self._send_json(import_boot_report(source=str(payload.get("source", "") or "")))
             else:
                 self._send_json(validate_payload(payload))
         except ValueError as exc:
             self._send_json({"ok": False, "errors": [str(exc)]}, status=400)
+        except Exception as exc:  # noqa: BLE001 - converted into desktop JSON.
+            self._send_json({"ok": False, "errors": [str(exc)]}, status=500)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -128,3 +156,13 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _bool_payload(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False

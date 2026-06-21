@@ -13,8 +13,11 @@ from easymanet.flash import (
     FlashEvent,
     FlashOptions,
     flash_image_details,
+    prepare_flash_workflow,
     run_flash_workflow,
 )
+from easymanet.diagnostics import export_support_bundle, import_boot_report, run_diagnostics
+from easymanet.support_bundle import create_support_bundle
 
 from .payloads import (
     disks_payload,
@@ -39,7 +42,7 @@ def flash_plan_payload(
     enable_ssh: bool = False,
     disable_ssh: bool = False,
 ) -> dict[str, Any]:
-    result = run_flash_workflow(
+    result = prepare_flash_workflow(
         FlashOptions(
             config=config,
             node=node,
@@ -53,6 +56,36 @@ def flash_plan_payload(
         )
     )
     payload = result.to_dict(include_events=True)
+    payload["image"] = _best_image_details(payload.get("image", {}), config=config, node=node)
+    return payload
+
+
+def prepare_flash_payload(
+    *,
+    config: str,
+    node: str,
+    device: str,
+    base_image: str | None = None,
+    image_sha256: str | None = None,
+    enable_ssh: bool = False,
+    disable_ssh: bool = False,
+    emit: Callable[[FlashEvent], None] | None = None,
+) -> dict[str, Any]:
+    result = prepare_flash_workflow(
+        FlashOptions(
+            config=config,
+            node=node,
+            device=device,
+            base_image=base_image,
+            image_sha256=image_sha256,
+            dry_run=False,
+            yes=True,
+            enable_ssh=enable_ssh,
+            disable_ssh=disable_ssh,
+        ),
+        emit=emit,
+    )
+    payload = result.to_dict(include_events=emit is None)
     payload["image"] = _best_image_details(payload.get("image", {}), config=config, node=node)
     return payload
 
@@ -117,8 +150,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     mesh_discover.add_argument("--config", default="")
     mesh_discover.add_argument("--scan-subnet", action="store_true")
 
+    support_bundle = subparsers.add_parser("support-bundle")
+    support_bundle.add_argument("--config", default="")
+    support_bundle.add_argument("--node", default="")
+    support_bundle.add_argument("--boot-report", default="")
+    support_bundle.add_argument("--output", default="")
+    support_bundle.add_argument("--include-disks", action="store_true")
+
+    diagnostics_run = subparsers.add_parser("diagnostics-run")
+    diagnostics_run.add_argument("--config", default="")
+
+    diagnostics_bundle = subparsers.add_parser("diagnostics-bundle")
+    diagnostics_bundle.add_argument("--config", default="")
+
+    diagnostics_import = subparsers.add_parser("diagnostics-import-boot-report")
+    diagnostics_import.add_argument("--source", required=True)
+
     flash_plan = subparsers.add_parser("flash-plan")
     _add_flash_args(flash_plan, include_yes=False)
+
+    prepare_flash = subparsers.add_parser("prepare-flash")
+    _add_flash_args(prepare_flash, include_yes=False)
 
     flash = subparsers.add_parser("flash")
     _add_flash_args(flash, include_yes=True)
@@ -140,6 +192,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "scan_subnet": args.scan_subnet,
                 }
             )
+        elif args.command == "support-bundle":
+            payload = create_support_bundle(
+                config=args.config,
+                node=args.node,
+                boot_report=args.boot_report,
+                output=args.output,
+                include_disks=args.include_disks,
+            ).to_dict()
+        elif args.command == "diagnostics-run":
+            payload = run_diagnostics(config=args.config)
+        elif args.command == "diagnostics-bundle":
+            payload = export_support_bundle(config=args.config)
+        elif args.command == "diagnostics-import-boot-report":
+            payload = import_boot_report(source=args.source)
         elif args.command == "flash-plan":
             payload = flash_plan_payload(
                 config=args.config,
@@ -150,6 +216,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 enable_ssh=args.enable_ssh,
                 disable_ssh=args.disable_ssh,
             )
+        elif args.command == "prepare-flash":
+            payload = prepare_flash_payload(
+                config=args.config,
+                node=args.node,
+                device=args.device,
+                base_image=args.base_image,
+                image_sha256=args.image_sha256,
+                enable_ssh=args.enable_ssh,
+                disable_ssh=args.disable_ssh,
+                emit=_print_bridge_event,
+            )
+            print(json.dumps({"type": "result", **payload}), flush=True)
+            return 0
         elif args.command == "flash":
             payload = flash_payload(
                 config=args.config,
@@ -169,6 +248,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - converted into bridge JSON.
         payload = {"ok": False, "errors": [str(exc)]}
 
+    if "args" in locals() and args.command in {"flash", "prepare-flash"}:
+        print(json.dumps({"type": "result", **payload}), flush=True)
+        return 0
     print(json.dumps(payload))
     return 0
 
