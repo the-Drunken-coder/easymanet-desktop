@@ -1,8 +1,9 @@
 {
   "name": "@easymanet/desktop-electron",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Local Electron shell for the EasyMANET operator console",
+  "license": "MIT",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
